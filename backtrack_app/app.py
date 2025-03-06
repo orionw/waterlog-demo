@@ -22,8 +22,10 @@ class EntropyControlLogitsProcessor(LogitsProcessor):
         self.token_entropies = []
     
     def calculate_entropy(self, logits):
+        # Add small epsilon for numerical stability
         probs = torch.softmax(logits, dim=-1)
-        entropy = -torch.sum(probs * torch.log2(probs))
+        eps = 1e-10  # Small epsilon to prevent log(0)
+        entropy = -torch.sum((probs + eps) * torch.log2(probs + eps))
         return 0.0 if torch.isnan(entropy) else entropy.item()
     
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
@@ -54,8 +56,8 @@ class EntropyControlLogitsProcessor(LogitsProcessor):
                 for i in range(batch_size):
                     mask[i][top_indices[i]] = True
                 
-                # Set equal probability (logit = 0.0) for top N tokens
-                new_scores[mask] = 0.0
+                # Set constant value for equal probability after softmax
+                new_scores[mask] = 1.0
                 
                 result = new_scores.squeeze(0) if len(original_shape) == 1 else new_scores
                 return result
@@ -128,9 +130,9 @@ def backtracking_generation(prompt, model, tokenizer, window_size=5, entropy_per
                     # Create new scores tensor with -inf everywhere
                     new_scores = torch.full_like(scores, float('-inf'))
                     
-                    # Set equal probability (0.0 logit) for the top 2 tokens
+                    # Set constant value for equal probability after softmax
                     for i in range(scores.shape[0]):
-                        new_scores[i, top_indices[i]] = 0.0
+                        new_scores[i, top_indices[i]] = 1.0
                     
                     # Return in the original shape
                     return new_scores.squeeze(0) if len(original_shape) == 1 else new_scores
@@ -161,6 +163,10 @@ def backtracking_generation(prompt, model, tokenizer, window_size=5, entropy_per
                 pad_token_id=tokenizer.eos_token_id,
                 repetition_penalty=1.1
             )
+            
+            # Update counter if in forced mode but didn't use it this token (safety)
+            if force_top2_for_window:
+                window_token_count += 1
         
         # Append new token to sequence
         generated_sequence = outputs
@@ -171,10 +177,13 @@ def backtracking_generation(prompt, model, tokenizer, window_size=5, entropy_per
         
         # Check if we have enough tokens to calculate window entropy
         if len(token_entropies) >= window_size and not force_top2_for_window:
-            # Calculate average entropy over the window
+            # Only consider the most recent window_size tokens for entropy calculation
             window_entropies = token_entropies[-window_size:]
             avg_window_entropy = sum(window_entropies) / window_size
             window_threshold = entropy_per_token * window_size
+            
+            # Add debug logging
+            print(f"Window entropy: {avg_window_entropy:.2f}, threshold: {window_threshold:.2f}")
             
             # Update our current entropy status
             current_window_low_entropy = (avg_window_entropy < window_threshold)
@@ -193,15 +202,20 @@ def backtracking_generation(prompt, model, tokenizer, window_size=5, entropy_per
                     generated_sequence = generated_sequence[:, :-window_size]
                     current_length = generated_sequence.shape[1]
                     
-                    # Reset entropy tracking for the new attempt
+                    # Reset entropy processor state to match current sequence
                     entropy_processor.reset_entropies()
+                    
+                    # Track the last few entropies for any tokens we're keeping
+                    previous_entropies = token_entropies[:-window_size] if len(token_entropies) > window_size else []
+                    for entropy in previous_entropies[-3:]:  # Keep a small buffer of previous entropies
+                        entropy_processor.token_entropies.append(entropy)
                     
                     print(f"Backtracking at position {current_length}. New temp: {current_temp:.2f}")
                 else:
                     # We've exhausted backtracking attempts, switch to top-2 mode for this window only
                     print(f"Switching to top-2 forced mode for this window after exhausting backtracking attempts")
                     force_top2_for_window = True
-                    window_token_count = 0  # Start counting tokens for this window
+                    window_token_count = 0  # Reset counter
                     # Reset attempt counter for future windows
                     backtracking_info["attempts"] = 0
                     # Reset entropy processor to start fresh for this window
